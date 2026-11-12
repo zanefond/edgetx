@@ -1,0 +1,76 @@
+name: Build EdgeTX X9D+ STM32F427 Firmware
+
+on:
+  push:
+    branches:
+      - 'x9dp-f427'
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build X9D+ F427 (${{ matrix.lang }})
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/edgetx/edgetx-dev:2.10.0
+    strategy:
+      fail-fast: false
+      matrix:
+        lang: [CN, EN]
+
+    steps:
+      - name: Checkout repository and submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Configure safe directory for git
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Build firmware and bootloader
+        run: |
+          LANG_NAME="${{ matrix.lang }}"
+          LANG_LOWER=$(echo "$LANG_NAME" | tr '[:upper:]' '[:lower:]')
+
+          echo "=========================================="
+          echo "Starting Build for X9D+ F427 ($LANG_NAME)"
+          echo "=========================================="
+
+          mkdir -p build && cd build
+
+          cmake \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_RULE_MESSAGES=OFF \
+            -Wno-dev \
+            -DPCB=X9D+ \
+            -DDEFAULT_MODE=2 \
+            -DGVARS=YES \
+            -DHELI=YES \
+            -DLUA=YES \
+            -DLUA_MIXER=YES \
+            -DMULTIMODULE=YES \
+            -DCROSSFIRE=YES \
+            -DGHOST=YES \
+            -DDISABLE_MCUCHECK=ON \
+            -DTRANSLATIONS=${LANG_NAME} \
+            ..
+
+          echo "Configuring arm-none-eabi..."
+          cmake --build . --target arm-none-eabi-configure
+
+          echo "Compiling firmware and checking memory size report..."
+          cmake --build arm-none-eabi -j$(nproc) --target firmware-size
+
+          echo "Preparing artifact outputs..."
+          mkdir -p ../artifacts
+          cp arm-none-eabi/firmware.bin "../artifacts/edgetx-x9dp-f427-${LANG_LOWER}.bin"
+          cp arm-none-eabi/bootloader.bin "../artifacts/bootloader-x9dp-f427.bin"
+          cp arm-none-eabi/firmware.elf "../artifacts/edgetx-x9dp-f427-${LANG_LOWER}.elf"
+
+          ls -lh ../artifacts/
+
+      - name: Upload firmware artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: edgetx-x9dp-f427-${{ matrix.lang }}
+          path: artifacts/
