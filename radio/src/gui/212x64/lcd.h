@@ -88,6 +88,9 @@
 #define DISPLAY_BUFFER_SIZE            (LCD_W*LCD_H*4/8)
 
 extern pixel_t displayBuf[DISPLAY_BUFFER_SIZE];
+#if !defined(BOOT) && defined(NV3007_LCD)
+extern uint8_t hiResGlyphMask[DISPLAY_BUFFER_SIZE];
+#endif
 extern coord_t lcdLastRightPos;
 extern coord_t lcdLastLeftPos;
 extern coord_t lcdNextPos;

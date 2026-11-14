@@ -29,6 +29,517 @@
   #include "opentx.h"
 #endif
 
+#if defined(NV3007_LCD)
+
+#define RESET_WAIT_DELAY_MS            300 // Wait time after LCD reset before power-on finish
+#define WAIT_FOR_DMA_END()             do { } while (lcd_busy)
+
+#define LCD_NCS_HIGH()                 LCD_NCS_GPIO->BSRRL = LCD_NCS_GPIO_PIN
+#define LCD_NCS_LOW()                  LCD_NCS_GPIO->BSRRH = LCD_NCS_GPIO_PIN
+
+#define LCD_A0_HIGH()                  LCD_SPI_GPIO->BSRRL = LCD_A0_GPIO_PIN
+#define LCD_A0_LOW()                   LCD_SPI_GPIO->BSRRH = LCD_A0_GPIO_PIN
+
+#define LCD_RST_HIGH()                 LCD_RST_GPIO->BSRRL = LCD_RST_GPIO_PIN
+#define LCD_RST_LOW()                  LCD_RST_GPIO->BSRRH = LCD_RST_GPIO_PIN
+
+#define NV3007_PHYS_W                  428
+#define NV3007_PHYS_H                  142
+#define NV3007_ACTIVE_X                2
+#define NV3007_ACTIVE_Y                7
+#define NV3007_LINE_PIXELS             (LCD_W * 2 * 2)
+#define NV3007_LINE_BYTES              (NV3007_LINE_PIXELS * 2)
+
+#define RGB565_SWAP(r, g, b)           ((uint16_t)(((uint16_t)(((r) & 0xF8) | ((g) >> 5))) | ((uint16_t)((((g) & 0x1C) << 3) | ((b) >> 3)) << 8)))
+
+bool lcdInitFinished = false;
+volatile bool lcd_busy = false;
+static uint16_t nv3007Lut[16];
+static uint16_t nv3007LineBuf[2][NV3007_LINE_PIXELS] __DMA;
+#if !defined(BOOT)
+static bool nv3007Flip = false;
+static int8_t nv3007LastTheme = -1;
+static int8_t nv3007LastFlip = -1;
+#endif
+
+void lcdInitFinish();
+
+static void nv3007SpiSendByte(uint8_t byte)
+{
+  while ((LCD_SPI->SR & SPI_SR_TXE) == 0) {
+  }
+  (void)LCD_SPI->DR;
+  LCD_SPI->DR = byte;
+  while ((LCD_SPI->SR & SPI_SR_RXNE) == 0) {
+  }
+  (void)LCD_SPI->DR;
+  while (LCD_SPI->SR & SPI_SR_BSY) {
+  }
+}
+
+void lcdWriteCommand(uint8_t byte)
+{
+  LCD_A0_LOW();
+  LCD_NCS_LOW();
+  nv3007SpiSendByte(byte);
+  LCD_NCS_HIGH();
+}
+
+static void lcdWriteData(uint8_t byte)
+{
+  LCD_A0_HIGH();
+  LCD_NCS_LOW();
+  nv3007SpiSendByte(byte);
+  LCD_NCS_HIGH();
+}
+
+void lcdHardwareInit()
+{
+  GPIO_InitTypeDef GPIO_InitStructure;
+
+  LCD_SPI->CR1 = 0;
+  LCD_SPI->CR1 = SPI_CR1_SSM | SPI_CR1_SSI | SPI_CR1_CPOL | SPI_CR1_CPHA | LCD_SPI_PRESCALER;
+  LCD_SPI->CR2 = 0;
+  LCD_SPI->CR1 |= SPI_CR1_MSTR;
+  LCD_SPI->CR1 |= SPI_CR1_SPE;
+
+  LCD_NCS_HIGH();
+
+  GPIO_InitStructure.GPIO_Pin = LCD_NCS_GPIO_PIN;
+  GPIO_InitStructure.GPIO_Mode = GPIO_Mode_OUT;
+  GPIO_InitStructure.GPIO_OType = GPIO_OType_PP;
+  GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
+  GPIO_InitStructure.GPIO_PuPd = GPIO_PuPd_NOPULL;
+  GPIO_Init(LCD_NCS_GPIO, &GPIO_InitStructure);
+
+  GPIO_InitStructure.GPIO_Pin = LCD_RST_GPIO_PIN;
+  GPIO_Init(LCD_RST_GPIO, &GPIO_InitStructure);
+
+  GPIO_InitStructure.GPIO_Pin = LCD_A0_GPIO_PIN;
+  GPIO_Init(LCD_SPI_GPIO, &GPIO_InitStructure);
+
+  GPIO_InitStructure.GPIO_Pin = LCD_CLK_GPIO_PIN | LCD_MOSI_GPIO_PIN;
+  GPIO_InitStructure.GPIO_Mode = GPIO_Mode_AF;
+  GPIO_Init(LCD_SPI_GPIO, &GPIO_InitStructure);
+
+  GPIO_PinAFConfig(LCD_SPI_GPIO, LCD_MOSI_GPIO_PinSource, LCD_GPIO_AF);
+  GPIO_PinAFConfig(LCD_SPI_GPIO, LCD_CLK_GPIO_PinSource, LCD_GPIO_AF);
+
+  LCD_DMA_Stream->CR &= ~DMA_SxCR_EN;
+  LCD_DMA->HIFCR = LCD_DMA_FLAGS;
+  LCD_DMA_Stream->CR = DMA_SxCR_PL_0 | DMA_SxCR_MINC | DMA_SxCR_DIR_0;
+  LCD_DMA_Stream->PAR = (uint32_t)&LCD_SPI->DR;
+  LCD_DMA_Stream->M0AR = (uint32_t)nv3007LineBuf[0];
+  LCD_DMA_Stream->NDTR = NV3007_LINE_BYTES;
+  LCD_DMA_Stream->FCR = 0x05;
+
+  NVIC_SetPriority(LCD_DMA_Stream_IRQn, 7);
+  NVIC_EnableIRQ(LCD_DMA_Stream_IRQn);
+}
+
+static void nv3007BuildLut(uint8_t theme)
+{
+#if defined(BOOT)
+  (void)theme;
+  uint8_t br = 8, bg = 24, bb = 56;
+  uint8_t fr = 255, fg = 255, fb = 255;
+#else
+  struct Nv3007Theme {
+    uint8_t br, bg, bb;
+    uint8_t fr, fg, fb;
+  };
+  static const Nv3007Theme themes[5] = {
+    {  8,  24,  56, 255, 255, 255 }, // 0: Deep Blue BG / White FG
+    { 170, 210, 140,  10,  20,  10 }, // 1: Classic Green LCD BG / Black FG
+    { 245, 195, 110,  48,  20,   4 }, // 2: Warm Amber BG / Dark Brown FG
+    { 255, 255, 255,   0,   0,   0 }, // 3: High-Contrast White BG / Black FG
+    {   8,  42,  56, 235, 255, 255 }, // 4: Dark Cyan Night BG / Cyan-White FG
+  };
+  const Nv3007Theme & t = themes[theme % 5];
+  uint8_t br = t.br, bg = t.bg, bb = t.bb;
+  uint8_t fr = t.fr, fg = t.fg, fb = t.fb;
+#endif
+  for (uint8_t i = 0; i < 16; i++) {
+    uint8_t r = (uint8_t)(br + ((int16_t)(fr - br) * i) / 15);
+    uint8_t g = (uint8_t)(bg + ((int16_t)(fg - bg) * i) / 15);
+    uint8_t b = (uint8_t)(bb + ((int16_t)(fb - bb) * i) / 15);
+    nv3007Lut[i] = RGB565_SWAP(r, g, b);
+  }
+}
+
+static void nv3007SetWindow(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2)
+{
+#if defined(BOOT)
+  uint16_t yOff = 14;
+#else
+  uint16_t yOff = nv3007Flip ? 12 : 14;
+#endif
+  uint16_t ry1 = y1 + yOff;
+  uint16_t ry2 = y2 + yOff;
+
+  lcdWriteCommand(0x2A);
+  lcdWriteData((uint8_t)(x1 >> 8));
+  lcdWriteData((uint8_t)(x1 & 0xFF));
+  lcdWriteData((uint8_t)(x2 >> 8));
+  lcdWriteData((uint8_t)(x2 & 0xFF));
+
+  lcdWriteCommand(0x2B);
+  lcdWriteData((uint8_t)(ry1 >> 8));
+  lcdWriteData((uint8_t)(ry1 & 0xFF));
+  lcdWriteData((uint8_t)(ry2 >> 8));
+  lcdWriteData((uint8_t)(ry2 & 0xFF));
+
+  lcdWriteCommand(0x2C);
+}
+
+static void nv3007FillFullScreen(uint16_t colorSwap)
+{
+  nv3007SetWindow(0, 0, NV3007_PHYS_W - 1, NV3007_PHYS_H - 1);
+
+  LCD_A0_HIGH();
+  LCD_NCS_LOW();
+  uint8_t b0 = (uint8_t)(colorSwap & 0xFF);
+  uint8_t b1 = (uint8_t)(colorSwap >> 8);
+  for (uint32_t i = 0; i < (uint32_t)NV3007_PHYS_W * NV3007_PHYS_H; i++) {
+    while ((LCD_SPI->SR & SPI_SR_TXE) == 0) {
+    }
+    LCD_SPI->DR = b0;
+    while ((LCD_SPI->SR & SPI_SR_TXE) == 0) {
+    }
+    LCD_SPI->DR = b1;
+  }
+  while (LCD_SPI->SR & SPI_SR_BSY) {
+  }
+  (void)LCD_SPI->DR;
+  (void)LCD_SPI->SR;
+  LCD_NCS_HIGH();
+}
+
+static void lcdStart()
+{
+  static const uint8_t nv3007InitSeq[] = {
+    0xff, 1, 0xa5,
+    0x9a, 1, 0x08,
+    0x9b, 1, 0x08,
+    0x9c, 1, 0xb0,
+    0x9d, 1, 0x16,
+    0x9e, 1, 0xc4,
+    0x8f, 2, 0x55, 0x04,
+    0x84, 1, 0x90,
+    0x83, 1, 0x7b,
+    0x85, 1, 0x33,
+    0x60, 1, 0x00,
+    0x70, 1, 0x00,
+    0x61, 1, 0x02,
+    0x71, 1, 0x02,
+    0x62, 1, 0x04,
+    0x72, 1, 0x04,
+    0x6c, 1, 0x29,
+    0x7c, 1, 0x29,
+    0x6d, 1, 0x31,
+    0x7d, 1, 0x31,
+    0x6e, 1, 0x0f,
+    0x7e, 1, 0x0f,
+    0x66, 1, 0x21,
+    0x76, 1, 0x21,
+    0x68, 1, 0x3a,
+    0x78, 1, 0x3a,
+    0x63, 1, 0x07,
+    0x73, 1, 0x07,
+    0x64, 1, 0x05,
+    0x74, 1, 0x05,
+    0x65, 1, 0x02,
+    0x75, 1, 0x02,
+    0x67, 1, 0x23,
+    0x77, 1, 0x23,
+    0x69, 1, 0x08,
+    0x79, 1, 0x08,
+    0x6a, 1, 0x13,
+    0x7a, 1, 0x13,
+    0x6b, 1, 0x13,
+    0x7b, 1, 0x13,
+    0x6f, 1, 0x00,
+    0x7f, 1, 0x00,
+    0x50, 1, 0x00,
+    0x52, 1, 0xd6,
+    0x53, 1, 0x08,
+    0x54, 1, 0x08,
+    0x55, 1, 0x1e,
+    0x56, 1, 0x1c,
+    0xa0, 3, 0x2b, 0x24, 0x00,
+    0xa1, 1, 0x87,
+    0xa2, 1, 0x86,
+    0xa5, 1, 0x00,
+    0xa6, 1, 0x00,
+    0xa7, 1, 0x00,
+    0xa8, 1, 0x36,
+    0xa9, 1, 0x7e,
+    0xaa, 1, 0x7e,
+    0xb9, 1, 0x85,
+    0xba, 1, 0x84,
+    0xbb, 1, 0x83,
+    0xbc, 1, 0x82,
+    0xbd, 1, 0x81,
+    0xbe, 1, 0x80,
+    0xbf, 1, 0x01,
+    0xc0, 1, 0x02,
+    0xc1, 1, 0x00,
+    0xc2, 1, 0x00,
+    0xc3, 1, 0x00,
+    0xc4, 1, 0x33,
+    0xc5, 1, 0x7e,
+    0xc6, 1, 0x7e,
+    0xc8, 2, 0x33, 0x33,
+    0xc9, 1, 0x68,
+    0xca, 1, 0x69,
+    0xcb, 1, 0x6a,
+    0xcc, 1, 0x6b,
+    0xcd, 2, 0x33, 0x33,
+    0xce, 1, 0x6c,
+    0xcf, 1, 0x6d,
+    0xd0, 1, 0x6e,
+    0xd1, 1, 0x6f,
+    0xab, 2, 0x03, 0x67,
+    0xac, 2, 0x03, 0x6b,
+    0xad, 2, 0x03, 0x68,
+    0xae, 2, 0x03, 0x6c,
+    0xb3, 1, 0x00,
+    0xb4, 1, 0x00,
+    0xb5, 1, 0x00,
+    0xb6, 1, 0x32,
+    0xb7, 1, 0x7e,
+    0xb8, 1, 0x7e,
+    0xe0, 1, 0x00,
+    0xe1, 2, 0x03, 0x0f,
+    0xe2, 1, 0x04,
+    0xe3, 1, 0x01,
+    0xe4, 1, 0x0e,
+    0xe5, 1, 0x01,
+    0xe6, 1, 0x19,
+    0xe7, 1, 0x10,
+    0xe8, 1, 0x10,
+    0xea, 1, 0x12,
+    0xeb, 1, 0xd0,
+    0xec, 1, 0x04,
+    0xed, 1, 0x07,
+    0xee, 1, 0x07,
+    0xef, 1, 0x09,
+    0xf0, 1, 0xd0,
+    0xf1, 1, 0x0e,
+    0xf9, 1, 0x17,
+    0xf2, 4, 0x2c, 0x1b, 0x0b, 0x20,
+    0xe9, 1, 0x29,
+    0xec, 1, 0x04,
+    0x35, 1, 0x00,
+    0x44, 2, 0x00, 0x10,
+    0x46, 1, 0x10,
+    0xff, 1, 0x00,
+    0x3a, 1, 0x05,
+  };
+
+  lcdWriteCommand(0x36);
+#if defined(BOOT)
+  lcdWriteData(0x70);
+#else
+  lcdWriteData(nv3007Flip ? 0xA0 : 0x70);
+#endif
+
+  uint16_t i = 0;
+  while (i < sizeof(nv3007InitSeq)) {
+    lcdWriteCommand(nv3007InitSeq[i++]);
+    uint8_t n = nv3007InitSeq[i++];
+    while (n--) {
+      lcdWriteData(nv3007InitSeq[i++]);
+    }
+  }
+}
+
+void lcdReset()
+{
+  LCD_NCS_HIGH();
+  LCD_RST_LOW();
+  delay_ms(30);
+  LCD_RST_HIGH();
+  delay_ms(100);
+}
+
+void lcdInit()
+{
+  lcdHardwareInit();
+  if (IS_LCD_RESET_NEEDED()) {
+    lcdReset();
+  }
+}
+
+void lcdInitFinish()
+{
+  lcdInitFinished = true;
+
+  if (!WAS_RESET_BY_WATCHDOG_OR_SOFTWARE()) {
+#if !defined(BOOT)
+    while (g_tmr10ms < (RESET_WAIT_DELAY_MS / 10));
+#else
+    delay_ms(RESET_WAIT_DELAY_MS);
+#endif
+  }
+
+#if defined(BOOT)
+  nv3007BuildLut(0);
+#else
+  uint8_t defTheme = (LCD_CONTRAST_DEFAULT % 30) / 6;
+  nv3007Flip = (LCD_CONTRAST_DEFAULT >= 30);
+  nv3007LastTheme = (int8_t)defTheme;
+  nv3007LastFlip = nv3007Flip ? 1 : 0;
+  nv3007BuildLut(defTheme);
+#endif
+
+  lcdStart();
+  lcdWriteCommand(0x11);
+  delay_ms(220);
+  nv3007FillFullScreen(nv3007Lut[0]);
+  lcdWriteCommand(0x29);
+  delay_ms(20);
+}
+
+void lcdOff()
+{
+  WAIT_FOR_DMA_END();
+  lcdWriteCommand(0x28);
+  delay_ms(20);
+  lcdWriteCommand(0x10);
+  delay_ms(3);
+}
+
+void lcdRefreshWait()
+{
+  WAIT_FOR_DMA_END();
+}
+
+static void nv3007FillLineBuf(uint8_t logicRow, uint16_t * dst)
+{
+  uint32_t rowOff = (uint32_t)(logicRow >> 1) * LCD_W;
+  const uint8_t * src = &displayBuf[rowOff];
+  bool oddRow = (logicRow & 1) != 0;
+  uint16_t * row0 = dst;
+  uint16_t * row1 = dst + LCD_W * 2;
+
+  for (coord_t lx = 0; lx < LCD_W; lx++) {
+    uint8_t b = src[lx];
+    uint8_t g = oddRow ? (b >> 4) : (b & 0x0F);
+    uint16_t cNorm = nv3007Lut[g];
+#if !defined(BOOT)
+    uint8_t mh = hiResGlyphMask[rowOff + lx];
+    uint8_t m = oddRow ? (mh >> 4) : (mh & 0x0F);
+    if (m) {
+      uint16_t cFlip = nv3007Lut[g ^ 0x0F];
+      row0[0] = (m & 1u) ? cFlip : cNorm;
+      row0[1] = (m & 2u) ? cFlip : cNorm;
+      row1[0] = (m & 4u) ? cFlip : cNorm;
+      row1[1] = (m & 8u) ? cFlip : cNorm;
+      row0 += 2;
+      row1 += 2;
+      continue;
+    }
+#endif
+    row0[0] = cNorm;
+    row0[1] = cNorm;
+    row1[0] = cNorm;
+    row1[1] = cNorm;
+    row0 += 2;
+    row1 += 2;
+  }
+}
+
+static void nv3007StartLineDma(const uint16_t * buf)
+{
+  lcd_busy = true;
+  LCD_DMA_Stream->CR &= ~DMA_SxCR_EN;
+  while (LCD_DMA_Stream->CR & DMA_SxCR_EN) {
+  }
+  LCD_DMA->HIFCR = LCD_DMA_FLAGS;
+  LCD_DMA_Stream->M0AR = (uint32_t)buf;
+  LCD_DMA_Stream->NDTR = NV3007_LINE_BYTES;
+  LCD_DMA_Stream->CR |= DMA_SxCR_EN | DMA_SxCR_TCIE;
+  LCD_SPI->CR2 |= SPI_CR2_TXDMAEN;
+}
+
+void lcdRefresh(bool wait)
+{
+  (void)wait;
+  if (!lcdInitFinished) {
+    lcdInitFinish();
+  }
+
+  WAIT_FOR_DMA_END();
+
+  nv3007SetWindow(NV3007_ACTIVE_X, NV3007_ACTIVE_Y,
+                  NV3007_ACTIVE_X + LCD_W * 2 - 1, NV3007_ACTIVE_Y + LCD_H * 2 - 1);
+
+  nv3007FillLineBuf(0, nv3007LineBuf[0]);
+
+  LCD_A0_HIGH();
+  LCD_NCS_LOW();
+  nv3007StartLineDma(nv3007LineBuf[0]);
+
+  for (uint8_t row = 1; row < LCD_H; row++) {
+    uint16_t * nextBuf = nv3007LineBuf[row & 1];
+    nv3007FillLineBuf(row, nextBuf);
+    WAIT_FOR_DMA_END();
+    nv3007StartLineDma(nextBuf);
+  }
+
+  WAIT_FOR_DMA_END();
+  LCD_NCS_HIGH();
+}
+
+extern "C" void LCD_DMA_Stream_IRQHandler()
+{
+  DEBUG_INTERRUPT(INT_LCD);
+
+  LCD_DMA_Stream->CR &= ~DMA_SxCR_TCIE;
+  LCD_DMA->HIFCR |= LCD_DMA_FLAG_INT;
+  LCD_SPI->CR2 &= ~SPI_CR2_TXDMAEN;
+  LCD_DMA_Stream->CR &= ~DMA_SxCR_EN;
+
+  while (LCD_SPI->SR & SPI_SR_BSY) {
+  }
+  (void)LCD_SPI->DR;
+  (void)LCD_SPI->SR;
+  lcd_busy = false;
+}
+
+void lcdSetRefVolt(uint8_t val)
+{
+  if (!lcdInitFinished) {
+    lcdInitFinish();
+  }
+#if defined(BOOT)
+  (void)val;
+#else
+  uint8_t theme = (val % 30) / 6;
+  bool flip = (val >= 30);
+  int8_t flipInt = flip ? 1 : 0;
+
+  if ((int8_t)theme == nv3007LastTheme && flipInt == nv3007LastFlip) {
+    return;
+  }
+
+  WAIT_FOR_DMA_END();
+
+  nv3007BuildLut(theme);
+  if (flipInt != nv3007LastFlip) {
+    nv3007Flip = flip;
+    lcdWriteCommand(0x36);
+    lcdWriteData(nv3007Flip ? 0xA0 : 0x70);
+  }
+  nv3007LastTheme = (int8_t)theme;
+  nv3007LastFlip = flipInt;
+  nv3007FillFullScreen(nv3007Lut[0]);
+#endif
+}
+
+#else
+
 #if defined(OLED_SCREEN)
   #define LCD_CONTRAST_OFFSET            0
 #elif defined(RADIO_FAMILY_JUMPER_T12) || defined(MANUFACTURER_RADIOMASTER) || defined(RADIO_COMMANDO8) || defined(RADIO_TPRO) || defined(RADIO_T12MAX)
@@ -422,3 +933,5 @@ void lcdSetRefVolt(uint8_t val)
   lcdWriteCommand(0x81); // Set Vop
   lcdWriteCommand(val+LCD_CONTRAST_OFFSET); // 0-255
 }
+
+#endif // NV3007_LCD

@@ -8,14 +8,34 @@ on:
 
 jobs:
   build:
-    name: Build X9D+ F427 (${{ matrix.lang }})
+    name: Build X9D+ F427 (${{ matrix.name }})
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/edgetx/edgetx-dev:2.10.0
     strategy:
       fail-fast: false
       matrix:
-        lang: [CN, EN]
+        include:
+          - name: CN
+            lang: CN
+            nv3007: "OFF"
+            fw_name: edgetx-x9dp-f427-cn
+            bl_name: bootloader-x9dp-f427
+          - name: EN
+            lang: EN
+            nv3007: "OFF"
+            fw_name: edgetx-x9dp-f427-en
+            bl_name: bootloader-x9dp-f427
+          - name: NV3007_CN
+            lang: CN
+            nv3007: "ON"
+            fw_name: edgetx-x9dp-f427-nv3007-cn
+            bl_name: bootloader-x9dp-f427-nv3007
+          - name: NV3007_EN
+            lang: EN
+            nv3007: "ON"
+            fw_name: edgetx-x9dp-f427-nv3007-en
+            bl_name: bootloader-x9dp-f427-nv3007
 
     steps:
       - name: Checkout repository and submodules
@@ -29,11 +49,9 @@ jobs:
 
       - name: Build firmware and bootloader
         run: |
-          LANG_NAME="${{ matrix.lang }}"
-          LANG_LOWER=$(echo "$LANG_NAME" | tr '[:upper:]' '[:lower:]')
-
           echo "=========================================="
-          echo "Starting Build for X9D+ F427 ($LANG_NAME)"
+          echo "Starting Build for X9D+ F427 (${{ matrix.name }})"
+          echo "  TRANSLATIONS=${{ matrix.lang }}, NV3007_LCD=${{ matrix.nv3007 }}"
           echo "=========================================="
 
           mkdir -p build && cd build
@@ -52,7 +70,8 @@ jobs:
             -DCROSSFIRE=YES \
             -DGHOST=YES \
             -DDISABLE_MCUCHECK=ON \
-            -DTRANSLATIONS=${LANG_NAME} \
+            -DTRANSLATIONS=${{ matrix.lang }} \
+            -DNV3007_LCD=${{ matrix.nv3007 }} \
             ..
 
           echo "Configuring arm-none-eabi..."
@@ -63,14 +82,15 @@ jobs:
 
           echo "Preparing artifact outputs..."
           mkdir -p ../artifacts
-          cp arm-none-eabi/firmware.bin "../artifacts/edgetx-x9dp-f427-${LANG_LOWER}.bin"
-          cp arm-none-eabi/bootloader.bin "../artifacts/bootloader-x9dp-f427.bin"
-          cp arm-none-eabi/firmware.elf "../artifacts/edgetx-x9dp-f427-${LANG_LOWER}.elf"
+          cp arm-none-eabi/firmware.bin "../artifacts/${{ matrix.fw_name }}.bin"
+          cp arm-none-eabi/bootloader.bin "../artifacts/${{ matrix.bl_name }}.bin"
+          cp arm-none-eabi/firmware.elf "../artifacts/${{ matrix.fw_name }}.elf"
 
-          ls -lh ../artifacts/
+          ls -la ../artifacts/
+          echo "Bootloader exact size: $(stat -c%s arm-none-eabi/bootloader.bin) bytes (limit 32768)"
 
       - name: Upload firmware artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: edgetx-x9dp-f427-${{ matrix.lang }}
+          name: edgetx-x9dp-f427-${{ matrix.name }}
           path: artifacts/

@@ -40,6 +40,11 @@
 #endif
 
 pixel_t displayBuf[DISPLAY_BUFFER_SIZE] __DMA;
+#if !defined(BOOT) && defined(NV3007_LCD)
+#include "font_cn_14x16.h"
+uint8_t hiResGlyphMask[DISPLAY_BUFFER_SIZE] __DMA;
+static coord_t protectCjkColX = -1;
+#endif
 
 inline bool lcdIsPointOutside(coord_t x, coord_t y)
 {
@@ -49,6 +54,9 @@ inline bool lcdIsPointOutside(coord_t x, coord_t y)
 void lcdClear()
 {
   memset(displayBuf, 0, DISPLAY_BUFFER_SIZE * sizeof(pixel_t));
+#if !defined(BOOT) && defined(NV3007_LCD)
+  memset(hiResGlyphMask, 0, DISPLAY_BUFFER_SIZE);
+#endif
 }
 
 coord_t lcdLastRightPos;
@@ -257,9 +265,148 @@ void lcdDrawChar(coord_t x, coord_t y, uint8_t c)
   lcdDrawChar(x, y, c, 0);
 }
 
+#if !defined(BOOT) && defined(NV3007_LCD)
+static bool isCjkUtf8(const char * s, uint16_t & unicode)
+{
+  const uint8_t b0 = (uint8_t)s[0];
+  if ((b0 & 0xF0) != 0xE0) return false;
+  const uint8_t b1 = (uint8_t)s[1];
+  if ((b1 & 0xC0) != 0x80) return false;
+  const uint8_t b2 = (uint8_t)s[2];
+  if ((b2 & 0xC0) != 0x80) return false;
+  unicode = ((uint16_t)(b0 & 0x0F) << 12) | ((uint16_t)(b1 & 0x3F) << 6) | (uint16_t)(b2 & 0x3F);
+  return unicode >= 0x3000;
+}
+
+static int findCnGlyph(uint16_t unicode)
+{
+  int lo = 0;
+  int hi = CN_FONT_COUNT - 1;
+  while (lo <= hi) {
+    int mid = (lo + hi) >> 1;
+    uint16_t code = cnFontCodes[mid];
+    if (code == unicode) return mid;
+    if (code < unicode) lo = mid + 1;
+    else hi = mid - 1;
+  }
+  return -1;
+}
+
+static inline void setHiResSubpixel(int16_t px, int16_t py)
+{
+  if (px < 0 || px >= LCD_W * 2 || py < 0 || py >= LCD_H * 2) return;
+  coord_t lx = px >> 1;
+  coord_t ly = py >> 1;
+  size_t idx = (size_t)(ly >> 1) * LCD_W + lx;
+  uint8_t subBit = (uint8_t)(((py & 1) << 1) | (px & 1));
+  hiResGlyphMask[idx] |= (ly & 1) ? (uint8_t)(1u << (4 + subBit)) : (uint8_t)(1u << subBit);
+}
+
+static void lcdDrawChineseChar(coord_t x, coord_t y, uint16_t unicode, LcdFlags flags, bool afterCjk)
+{
+  bool blink = false;
+  bool inv = false;
+  if (flags & BLINK) {
+    if (BLINK_ON_PHASE) {
+      if (flags & INVERS)
+        inv = true;
+      else
+        blink = true;
+    }
+  }
+  else if (flags & INVERS) {
+    inv = true;
+  }
+
+  uint8_t scale = (FONTSIZE(flags) == DBLSIZE) ? 2 : 1;
+  uint8_t logW = CN_LOGICAL_W * scale;
+  uint8_t logH = 8 * scale;
+
+  if (!blink) {
+    int8_t startDx = (inv && x > 0 && !afterCjk) ? -1 : 0;
+    int8_t startDy = (inv && y > 0 && scale == 1) ? -1 : 0;
+    LcdFlags bgAtt = inv ? FORCE : ERASE;
+    for (int8_t dx = startDx; dx < (int8_t)logW; dx++) {
+      for (int8_t dy = startDy; dy < (int8_t)logH; dy++) {
+        lcdDrawPoint(x + dx, y + dy, bgAtt);
+      }
+    }
+
+    int16_t basePx = x * 2;
+    int16_t basePy = y * 2;
+    int glyphIdx = findCnGlyph(unicode);
+    if (glyphIdx >= 0) {
+      for (uint8_t col = 0; col < CN_FONT_W; col++) {
+        uint16_t colBits = cnFontBitmaps[glyphIdx][col];
+        if (!colBits) continue;
+        for (uint8_t row = 0; row < CN_FONT_H; row++) {
+          if (colBits & (1u << row)) {
+            if (scale == 1) {
+              setHiResSubpixel(basePx + col, basePy + row);
+            }
+            else {
+              int16_t px = basePx + col * 2;
+              int16_t py = basePy + row * 2;
+              setHiResSubpixel(px, py);
+              setHiResSubpixel(px + 1, py);
+              setHiResSubpixel(px, py + 1);
+              setHiResSubpixel(px + 1, py + 1);
+            }
+          }
+        }
+      }
+    }
+    else {
+      for (uint8_t row = 2; row <= 13; row++) {
+        for (uint8_t col = 2; col <= 11; col++) {
+          if (row == 2 || row == 13 || col == 2 || col == 11) {
+            if (scale == 1) {
+              setHiResSubpixel(basePx + col, basePy + row);
+            }
+            else {
+              int16_t px = basePx + col * 2;
+              int16_t py = basePy + row * 2;
+              setHiResSubpixel(px, py);
+              setHiResSubpixel(px + 1, py);
+              setHiResSubpixel(px, py + 1);
+              setHiResSubpixel(px + 1, py + 1);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  lcdNextPos = x + logW;
+}
+#endif
+
 uint8_t getTextWidth(const char * s, uint8_t len, LcdFlags flags)
 {
   uint8_t width = 0;
+#if !defined(BOOT) && defined(NV3007_LCD)
+  bool unlimited = (len == 0);
+  uint8_t cnW = CN_LOGICAL_W * ((FONTSIZE(flags) == DBLSIZE) ? 2 : 1);
+  while (s && *s && (unlimited || len > 0)) {
+    uint16_t unicode = 0;
+    if ((unlimited || len >= 3) && isCjkUtf8(s, unicode)) {
+      width += cnW;
+      s += 3;
+      if (!unlimited) len -= 3;
+      continue;
+    }
+    uint8_t rem = unlimited ? 255 : (len - 1);
+    unsigned char c = map_utf8_char(s, rem);
+    if (!c) {
+      break;
+    }
+    if (!unlimited) {
+      len = rem;
+    }
+    width += getCharWidth(c, flags) + 1;
+    s++;
+  }
+#else
   for (int i = 0; len == 0 || i < len; ++i) {
     unsigned char c = map_utf8_char(s, len);
     if (!c) {
@@ -268,6 +415,7 @@ uint8_t getTextWidth(const char * s, uint8_t len, LcdFlags flags)
     width += getCharWidth(c, flags) + 1;
     s++;
   }
+#endif
   return width;
 }
 
@@ -278,6 +426,9 @@ void lcdDrawSizedText(coord_t x, coord_t y, const char * s, uint8_t len, LcdFlag
   uint32_t fontsize = FONTSIZE(flags);
   bool setx = false;
   uint8_t width = 0;
+#if !defined(BOOT) && defined(NV3007_LCD)
+  bool afterCjk = false;
+#endif
 
   if (flags & RIGHT) {
     width = getTextWidth(s, len, flags);
@@ -294,12 +445,30 @@ void lcdDrawSizedText(coord_t x, coord_t y, const char * s, uint8_t len, LcdFlag
     if (setx) {
       x = c;
       setx = false;
+#if !defined(BOOT) && defined(NV3007_LCD)
+      afterCjk = false;
+#endif
     }
     else if (!c) {
       break;
     }
     else if (c >= 0x20) {
 #if !defined(BOOT)
+#if defined(NV3007_LCD)
+      uint16_t unicode = 0;
+      if (len >= 2 && isCjkUtf8(s, unicode)) {
+        lcdDrawChineseChar(x, y, unicode, flags, afterCjk);
+        x = lcdNextPos;
+        afterCjk = true;
+        s += 2;
+        len -= 2;
+        s++;
+        continue;
+      }
+      if (afterCjk && (flags & INVERS) && x > 0) {
+        protectCjkColX = x - 1;
+      }
+#endif
       // UTF8 detection
       c = map_utf8_char(s, len);
       if (!c) break;
@@ -317,6 +486,10 @@ void lcdDrawSizedText(coord_t x, coord_t y, const char * s, uint8_t len, LcdFlag
         lcdDrawChar(x, y, c, flags);
         x = lcdNextPos;
       }
+#if defined(NV3007_LCD)
+      protectCjkColX = -1;
+      afterCjk = false;
+#endif
 #else
       lcdDrawChar(x, y, c, flags);
       x = lcdNextPos;
@@ -335,17 +508,29 @@ void lcdDrawSizedText(coord_t x, coord_t y, const char * s, uint8_t len, LcdFlag
         y += 4;
       else if (fontsize == SMLSIZE)
         y--;
+#if !defined(BOOT) && defined(NV3007_LCD)
+      afterCjk = false;
+#endif
       if (y >= LCD_H) break;
     }
     else if (c == 0x1D) {  // TAB
       x |= 0x3F;
       x += 1;
+#if !defined(BOOT) && defined(NV3007_LCD)
+      afterCjk = false;
+#endif
     }
     else {
       x += (c * FW/2); // EXTENDED SPACE
+#if !defined(BOOT) && defined(NV3007_LCD)
+      afterCjk = false;
+#endif
     }
     s++;
   }
+#if !defined(BOOT) && defined(NV3007_LCD)
+  protectCjkColX = -1;
+#endif
 
   lcdLastRightPos = x;
   lcdNextPos = x;
@@ -371,7 +556,11 @@ void lcdDrawSizedText(coord_t x, coord_t y, const char * s, uint8_t len)
 
 void lcdDrawCenteredText(coord_t y, const char * s, LcdFlags flags)
 {
+#if !defined(BOOT) && defined(NV3007_LCD)
+  coord_t x = (LCD_W - getTextWidth(s, 0, flags)) / 2;
+#else
   coord_t x = (LCD_W - getTextWidth(s, flags)) / 2;
+#endif
   lcdDrawText(x, y, s, flags);
 }
 
@@ -824,6 +1013,15 @@ void lcdMaskPoint(uint8_t *p, uint8_t mask, LcdFlags att)
   else {
     *p ^= mask;
   }
+#if !defined(BOOT) && defined(NV3007_LCD)
+  if (att & (FORCE | ERASE)) {
+    size_t idx = (size_t)(p - displayBuf);
+    if (!(att == FORCE && protectCjkColX >= 0 && (coord_t)(idx % LCD_W) == protectCjkColX)) {
+      uint8_t clr = ((mask & 0x0F) ? 0x0F : 0) | ((mask & 0xF0) ? 0xF0 : 0);
+      hiResGlyphMask[idx] &= ~clr;
+    }
+  }
+#endif
 }
 
 #define PIXEL_GREY_MASK(y, att) (((y) & 1) ? (0xF0 - (COLOUR_MASK(att) >> 12)) : (0x0F - (COLOUR_MASK(att) >> 16)))
@@ -937,12 +1135,21 @@ void lcdDrawBitmap(coord_t x, coord_t y, const uint8_t * img, coord_t offset, co
       uint8_t b = *q++;
       if (y & 1) {
         *p = (*p & 0x0f) + ((b & 0x0f) << 4);
+#if defined(NV3007_LCD)
+        hiResGlyphMask[p - displayBuf] &= 0x0f;
+#endif
         if ((p+LCD_W) < DISPLAY_END) {
           *(p+LCD_W) = (*(p+LCD_W) & 0xf0) + ((b & 0xf0) >> 4);
+#if defined(NV3007_LCD)
+          hiResGlyphMask[(p + LCD_W) - displayBuf] &= 0xf0;
+#endif
         }
       }
       else {
         *p = b;
+#if defined(NV3007_LCD)
+        hiResGlyphMask[p - displayBuf] = 0;
+#endif
       }
       p++;
     }
@@ -970,17 +1177,32 @@ void lcdDrawRleBitmap(coord_t x, coord_t y, const uint8_t * img, coord_t offset,
         if (p >= DISPLAY_END) return;
         uint8_t b = pic.getNext();
         if (y & 1) {
-          if (b & 0x0f)
+          if (b & 0x0f) {
             *p = (*p & 0x0f) + ((b & 0x0f) << 4);
-          if ((p+LCD_W) < DISPLAY_END && b & 0xf0) {
+#if defined(NV3007_LCD)
+            hiResGlyphMask[p - displayBuf] &= 0x0f;
+#endif
+          }
+          if ((p+LCD_W) < DISPLAY_END && (b & 0xf0)) {
             *(p+LCD_W) = (*(p+LCD_W) & 0xf0) + ((b & 0xf0) >> 4);
+#if defined(NV3007_LCD)
+            hiResGlyphMask[(p + LCD_W) - displayBuf] &= 0xf0;
+#endif
           }
         }
         else {
-          if (b & 0x0f)
+          if (b & 0x0f) {
             *p = (*p & 0xf0) + (b & 0x0f);
-          if (b & 0xf0)
+#if defined(NV3007_LCD)
+            hiResGlyphMask[p - displayBuf] &= 0xf0;
+#endif
+          }
+          if (b & 0xf0) {
             *p = (*p & 0x0f) + (b & 0xf0);
+#if defined(NV3007_LCD)
+            hiResGlyphMask[p - displayBuf] &= 0x0f;
+#endif
+          }
         }
         p++;
       }
@@ -990,12 +1212,21 @@ void lcdDrawRleBitmap(coord_t x, coord_t y, const uint8_t * img, coord_t offset,
         uint8_t b = pic.getNext();
         if (y & 1) {
           *p = (*p & 0x0f) + ((b & 0x0f) << 4);
+#if defined(NV3007_LCD)
+          hiResGlyphMask[p - displayBuf] &= 0x0f;
+#endif
           if ((p+LCD_W) < DISPLAY_END) {
             *(p+LCD_W) = (*(p+LCD_W) & 0xf0) + ((b & 0xf0) >> 4);
+#if defined(NV3007_LCD)
+            hiResGlyphMask[(p + LCD_W) - displayBuf] &= 0xf0;
+#endif
           }
         }
         else {
           *p = b;
+#if defined(NV3007_LCD)
+          hiResGlyphMask[p - displayBuf] = 0;
+#endif
         }
         p++;
       }
