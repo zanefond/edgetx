@@ -19,23 +19,39 @@ jobs:
           - name: CN
             lang: CN
             nv3007: "OFF"
+            nv3041: "OFF"
             fw_name: edgetx-x9dp-f427-cn
             bl_name: bootloader-x9dp-f427
           - name: EN
             lang: EN
             nv3007: "OFF"
+            nv3041: "OFF"
             fw_name: edgetx-x9dp-f427-en
             bl_name: bootloader-x9dp-f427
           - name: NV3007_CN
             lang: CN
             nv3007: "ON"
+            nv3041: "OFF"
             fw_name: edgetx-x9dp-f427-nv3007-cn
             bl_name: bootloader-x9dp-f427-nv3007
           - name: NV3007_EN
             lang: EN
             nv3007: "ON"
+            nv3041: "OFF"
             fw_name: edgetx-x9dp-f427-nv3007-en
             bl_name: bootloader-x9dp-f427-nv3007
+          - name: NV3041_CN
+            lang: CN
+            nv3007: "OFF"
+            nv3041: "ON"
+            fw_name: edgetx-x9dp-f427-nv3041-cn
+            bl_name: bootloader-x9dp-f427-nv3041
+          - name: NV3041_EN
+            lang: EN
+            nv3007: "OFF"
+            nv3041: "ON"
+            fw_name: edgetx-x9dp-f427-nv3041-en
+            bl_name: bootloader-x9dp-f427-nv3041
 
     steps:
       - name: Checkout repository and submodules
@@ -51,7 +67,7 @@ jobs:
         run: |
           echo "=========================================="
           echo "Starting Build for X9D+ F427 (${{ matrix.name }})"
-          echo "  TRANSLATIONS=${{ matrix.lang }}, NV3007_LCD=${{ matrix.nv3007 }}"
+          echo "  TRANSLATIONS=${{ matrix.lang }}, NV3007_LCD=${{ matrix.nv3007 }}, NV3041_LCD=${{ matrix.nv3041 }}"
           echo "=========================================="
 
           mkdir -p build && cd build
@@ -72,6 +88,7 @@ jobs:
             -DDISABLE_MCUCHECK=ON \
             -DTRANSLATIONS=${{ matrix.lang }} \
             -DNV3007_LCD=${{ matrix.nv3007 }} \
+            -DNV3041_LCD=${{ matrix.nv3041 }} \
             ..
 
           echo "Configuring arm-none-eabi..."
